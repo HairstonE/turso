@@ -6,6 +6,7 @@ use turso_parser::ast::{self, SortOrder, SubqueryType};
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
+    function::{ExtFunc, Func},
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
@@ -628,6 +629,20 @@ where
         Ok(())
     }
 
+    /// Returns true if `name` resolves to an aggregate function (either a
+    /// built-in `Func::Agg(_)` or a user-defined `Func::External` aggregate).
+    fn is_aggregate(&self, name: &ast::Name, arg_count: usize) -> Result<bool> {
+        Ok(self
+            .resolver
+            .resolve_function(name.as_str(), arg_count)?
+            .as_ref()
+            .is_some_and(|f| match f {
+                Func::Agg(_) => true,
+                Func::External(ext) => matches!(ext.func, ExtFunc::Aggregate { .. }),
+                _ => false,
+            }))
+    }
+
     fn visit(&mut self, expr: &mut ast::Expr) -> Result<WalkControl> {
         match expr {
             ast::Expr::Exists(_) => {
@@ -945,6 +960,43 @@ where
                     eval_phase: self.origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
+            }
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                order_by,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() || !self.is_aggregate(name, args.len())? {
+                    return Ok(WalkControl::Continue);
+                }
+
+                let saved = self.origin;
+                self.origin = SubqueryOrigin::AggregateBody;
+                for arg in args.iter_mut() {
+                    walk_expr_mut(arg, &mut |e| self.visit(e))?;
+                }
+                for sc in order_by.iter_mut() {
+                    walk_expr_mut(&mut sc.expr, &mut |e| self.visit(e))?;
+                }
+                if let Some(fc) = filter_over.filter_clause.as_deref_mut() {
+                    walk_expr_mut(fc, &mut |e| self.visit(e))?;
+                }
+                self.origin = saved;
+                Ok(WalkControl::SkipChildren)
+            }
+            ast::Expr::FunctionCallStar { filter_over, .. } => {
+                if filter_over.over_clause.is_some() {
+                    return Ok(WalkControl::Continue);
+                }
+                let saved = self.origin;
+                self.origin = SubqueryOrigin::AggregateBody;
+                if let Some(fc) = filter_over.filter_clause.as_deref_mut() {
+                    walk_expr_mut(fc, &mut |e| self.visit(e))?;
+                }
+                self.origin = saved;
+                Ok(WalkControl::SkipChildren)
             }
             _ => Ok(WalkControl::Continue),
         }

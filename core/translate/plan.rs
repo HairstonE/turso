@@ -288,6 +288,7 @@ pub enum SubqueryOrigin {
     SelectHaving,
     SelectOrderBy,
     SelectLimitOffset,
+    AggregateBody,
     DmlWhere,
     DmlSet,
     DmlReturning,
@@ -303,6 +304,7 @@ impl SubqueryOrigin {
             | SubqueryOrigin::SelectHaving
             | SubqueryOrigin::SelectOrderBy
             | SubqueryOrigin::SelectLimitOffset
+            | SubqueryOrigin::AggregateBody
             | SubqueryOrigin::TriggerWhen => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlWhere => SubqueryEvalPhase::BeforeLoop,
             SubqueryOrigin::DmlSet => SubqueryEvalPhase::PreWrite,
