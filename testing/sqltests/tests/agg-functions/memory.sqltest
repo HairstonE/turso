@@ -469,3 +469,42 @@ test filter-with-null-agg-arg {
 expect {
     2|4
 }
+
+# Regression tests for #6807: aggregate FILTER / args containing a subquery
+# in HAVING or grouped ORDER BY used to panic because the IN-subquery's
+# ephemeral cursor was scheduled in the post-grouping phase, but the FILTER
+# / agg arg is evaluated per-row inside the main loop.
+
+@cross-check-integrity
+test agg-filter-in-subquery-in-having {
+    SELECT 1
+    GROUP BY 1
+    HAVING COUNT(*) FILTER (WHERE 1 IN (SELECT 2)) = 1;
+}
+expect {
+}
+
+@cross-check-integrity
+test agg-arg-subquery-in-having {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1, 2);
+    SELECT a FROM t
+    GROUP BY a
+    HAVING COUNT(CASE WHEN b IN (SELECT 2) THEN 1 END) > 0;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test agg-filter-in-subquery-in-grouped-order-by {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1, 2), (1, 3), (2, 4);
+    SELECT a, COUNT(*) FROM t
+    GROUP BY a
+    ORDER BY COUNT(*) FILTER (WHERE b IN (SELECT 2));
+}
+expect {
+    2|1
+    1|2
+}
