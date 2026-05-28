@@ -311,26 +311,26 @@ pub fn plan_subqueries_from_select_plan(
     // LIMIT and OFFSET cannot reference columns from the outer query
     let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
     {
-        let mut subquery_parser = get_subquery_parser(
+        let mut subquery_parser = SubqueryParser {
             program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
+            out_subqueries: &mut plan.non_from_clause_subqueries,
+            referenced_tables: &mut plan.table_references,
             resolver,
             connection,
             get_outer_query_refs,
-            SubqueryPosition::LimitOffset,
-            SubqueryOrigin::SelectLimitOffset,
-            false,
-        );
+            position: SubqueryPosition::LimitOffset,
+            origin: SubqueryOrigin::SelectLimitOffset,
+            allow_correlated: false,
+        };
         // Limit
         if let Some(limit) = &mut plan.limit {
             crate::stack::trace_stack!("select_limit");
-            walk_expr_mut(limit, &mut subquery_parser)?;
+            walk_expr_mut(limit, &mut |e| subquery_parser.visit(e))?;
         }
         // Offset
         if let Some(offset) = &mut plan.offset {
             crate::stack::trace_stack!("select_offset");
-            walk_expr_mut(offset, &mut subquery_parser)?;
+            walk_expr_mut(offset, &mut |e| subquery_parser.visit(e))?;
         }
     }
 
@@ -563,7 +563,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
         Ok(outer_refs)
     };
 
-    let mut subquery_parser = get_subquery_parser(
+    let mut subquery_parser = SubqueryParser {
         program,
         out_subqueries,
         referenced_tables,
@@ -573,49 +573,71 @@ fn plan_subqueries_with_outer_query_access<'a>(
         position,
         origin,
         allow_correlated,
-    );
+    };
     for expr in exprs {
-        walk_expr_mut(expr, &mut subquery_parser)?;
+        walk_expr_mut(expr, &mut |e| subquery_parser.visit(e))?;
     }
 
     Ok(())
 }
 
-/// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
-#[allow(clippy::too_many_arguments)]
-fn get_subquery_parser<'a>(
+/// Walks expressions and replaces nested subqueries (`EXISTS`, scalar
+/// `(SELECT ...)`, and `x IN (SELECT ...)`) with [`ast::Expr::SubqueryResult`]
+/// placeholders, recording each replacement in `out_subqueries` so the emitter
+/// can later produce bytecode for the subquery body at the right phase.
+///
+/// Carries `origin` as a field rather than a captured constant so the visit
+/// method can swap it for the duration of a subtree (e.g. when descending into
+/// an aggregate's arguments or FILTER, where the value is needed at per-row
+/// accumulation time rather than at the syntactic clause's natural phase).
+///
+/// Struct rather than a returned closure because the aggregate intercept needs
+/// to recursively re-invoke the visitor on child expressions with a swapped
+/// origin. A closure cannot do this — it has no self-name to pass to
+/// `walk_expr_mut`, and its captured `&mut` borrows of `program` /
+/// `out_subqueries` / etc. cannot coexist with a second mutable borrow of the
+/// closure itself. Collapsing the captures into `&mut self` lets recursion go
+/// through `walk_expr_mut(child, &mut |e| self.visit(e))` with a single live
+/// borrow at a time.
+struct SubqueryParser<'a, F>
+where
+    F: Fn(&TableReferences) -> Result<crate::alloc::Vec<OuterQueryReference>>,
+{
     program: &'a mut ProgramBuilder,
     out_subqueries: &'a mut Vec<NonFromClauseSubquery>,
     referenced_tables: &'a mut TableReferences,
-    resolver: &'a Resolver,
+    resolver: &'a Resolver<'a>,
     connection: &'a Arc<Connection>,
-    get_outer_query_refs: impl Fn(&TableReferences) -> Result<crate::alloc::Vec<OuterQueryReference>>
-        + 'a,
+    get_outer_query_refs: F,
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
-) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
-    let handle_unsupported_correlation =
-        |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
-            if correlated && !allow_correlated {
-                crate::bail_parse_error!(
-                    "correlated subqueries in {} clause are not supported yet",
-                    position.name()
-                );
-            }
-            Ok(())
-        };
+}
 
-    move |expr: &mut ast::Expr| -> Result<WalkControl> {
+impl<'a, F> SubqueryParser<'a, F>
+where
+    F: Fn(&TableReferences) -> Result<crate::alloc::Vec<OuterQueryReference>>,
+{
+    fn handle_unsupported_correlation(&self, correlated: bool) -> Result<()> {
+        if correlated && !self.allow_correlated {
+            crate::bail_parse_error!(
+                "correlated subqueries in {} clause are not supported yet",
+                self.position.name()
+            );
+        }
+        Ok(())
+    }
+
+    fn visit(&mut self, expr: &mut ast::Expr) -> Result<WalkControl> {
         match expr {
             ast::Expr::Exists(_) => {
-                let subquery_id = program.table_reference_counter.next();
+                let subquery_id = self.program.table_reference_counter.next();
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
-                    get_outer_query_refs(referenced_tables)
+                    (self.get_outer_query_refs)(self.referenced_tables)
                 }?;
 
-                let result_reg = program.alloc_register();
+                let result_reg = self.program.alloc_register();
                 let subquery_type = SubqueryType::Exists { result_reg };
                 let result_expr = ast::Expr::SubqueryResult {
                     subquery_id,
@@ -632,37 +654,37 @@ fn get_subquery_parser<'a>(
 
                 let plan = prepare_select_plan(
                     subselect,
-                    resolver,
-                    program,
+                    self.resolver,
+                    self.program,
                     &outer_query_refs,
                     QueryDestination::ExistsSubqueryResult { result_reg },
-                    connection,
+                    self.connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver)?;
+                optimize_select_plan(&mut plan, self.resolver)?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
-                out_subqueries.push(NonFromClauseSubquery {
+                self.handle_unsupported_correlation(correlated)?;
+                self.out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(Plan::Select(plan))),
                     },
                     correlated,
-                    origin,
-                    eval_phase: origin.phase_floor(),
+                    origin: self.origin,
+                    eval_phase: self.origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
             ast::Expr::Subquery(_) => {
-                let subquery_id = program.table_reference_counter.next();
+                let subquery_id = self.program.table_reference_counter.next();
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
-                    get_outer_query_refs(referenced_tables)
+                    (self.get_outer_query_refs)(self.referenced_tables)
                 }?;
 
                 let result_expr = ast::Expr::SubqueryResult {
@@ -684,20 +706,20 @@ fn get_subquery_parser<'a>(
                 };
                 let plan = prepare_select_plan(
                     subselect,
-                    resolver,
-                    program,
+                    self.resolver,
+                    self.program,
                     &outer_query_refs,
                     QueryDestination::Unset,
-                    connection,
+                    self.connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver)?;
+                optimize_select_plan(&mut plan, self.resolver)?;
                 let reg_count = plan.result_columns.len();
-                let reg_start = program.alloc_registers(reg_count);
+                let reg_start = self.program.alloc_registers(reg_count);
 
                 if reg_count == 1 {
                     if let Some(result_col) = plan.result_columns.first() {
@@ -706,7 +728,7 @@ fn get_subquery_parser<'a>(
                             Some(&plan.table_references),
                             None,
                         );
-                        resolver
+                        self.resolver
                             .subquery_affinities
                             .borrow_mut()
                             .insert(subquery_id, affinity);
@@ -752,9 +774,9 @@ fn get_subquery_parser<'a>(
                 *num_regs = reg_count;
 
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                self.handle_unsupported_correlation(correlated)?;
 
-                out_subqueries.push(NonFromClauseSubquery {
+                self.out_subqueries.push(NonFromClauseSubquery {
                     internal_id: *subquery_id,
                     query_type: SubqueryType::RowValue {
                         result_reg_start: reg_start,
@@ -764,16 +786,16 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(Plan::Select(plan))),
                     },
                     correlated,
-                    origin,
-                    eval_phase: origin.phase_floor(),
+                    origin: self.origin,
+                    eval_phase: self.origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
             ast::Expr::InSelect { .. } => {
-                let subquery_id = program.table_reference_counter.next();
+                let subquery_id = self.program.table_reference_counter.next();
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
-                    get_outer_query_refs(referenced_tables)
+                    (self.get_outer_query_refs)(self.referenced_tables)
                 }?;
 
                 let ast::Expr::InSelect { lhs, not, rhs } = ({
@@ -784,15 +806,15 @@ fn get_subquery_parser<'a>(
                 };
                 let plan = prepare_select_plan(
                     rhs,
-                    resolver,
-                    program,
+                    self.resolver,
+                    self.program,
                     &outer_query_refs,
                     QueryDestination::Unset,
-                    connection,
+                    self.connection,
                 )?;
                 let mut plan = match plan {
                     Plan::Select(mut select_plan) => {
-                        optimize_select_plan(&mut select_plan, resolver)?;
+                        optimize_select_plan(&mut select_plan, self.resolver)?;
                         Plan::Select(select_plan)
                     }
                     Plan::CompoundSelect {
@@ -802,9 +824,9 @@ fn get_subquery_parser<'a>(
                         offset,
                         order_by,
                     } => {
-                        optimize_select_plan(&mut right_most, resolver)?;
+                        optimize_select_plan(&mut right_most, self.resolver)?;
                         for (select_plan, _) in left.iter_mut() {
-                            optimize_select_plan(select_plan, resolver)?;
+                            optimize_select_plan(select_plan, self.resolver)?;
                         }
                         Plan::CompoundSelect {
                             left,
@@ -842,7 +864,7 @@ fn get_subquery_parser<'a>(
                 let mut lhs_collations = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
                     let lhs_affinity =
-                        get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
+                        get_expr_affinity_info(lhs_expr, Some(self.referenced_tables), None);
                     affinity_chars.push(
                         compare_affinity(
                             &result_columns[i].expr,
@@ -852,7 +874,7 @@ fn get_subquery_parser<'a>(
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(get_collseq_from_expr(lhs_expr, referenced_tables)?);
+                    lhs_collations.push(get_collseq_from_expr(lhs_expr, self.referenced_tables)?);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -885,8 +907,9 @@ fn get_subquery_parser<'a>(
                     on_conflict: None,
                 });
 
-                let cursor_id =
-                    program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
+                let cursor_id = self
+                    .program
+                    .alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
 
                 *plan.select_query_destination_mut().unwrap() = QueryDestination::EphemeralIndex {
                     cursor_id,
@@ -906,9 +929,9 @@ fn get_subquery_parser<'a>(
                 };
 
                 let correlated = plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                self.handle_unsupported_correlation(correlated)?;
 
-                out_subqueries.push(NonFromClauseSubquery {
+                self.out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     query_type: SubqueryType::In {
                         cursor_id,
@@ -918,8 +941,8 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
-                    origin,
-                    eval_phase: origin.phase_floor(),
+                    origin: self.origin,
+                    eval_phase: self.origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
             }
